@@ -67,6 +67,12 @@ const VALID_FREQUENCIES = new Set([
 
 const VALID_CONTACT_METHODS = new Set(['text', 'call', 'email', 'any']);
 
+const IMAGE_BUCKET = 'lawncare-lead-images';
+const MAX_IMAGE_FILES = 4;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const VALID_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
+const VALID_IMAGE_EXTENSIONS = /\.(jpe?g|png|webp|heic|heif)$/i;
+
 const MAX_LENGTHS = {
   name: 40,
   phone: 24,
@@ -176,8 +182,9 @@ function getCampaignParams() {
   };
 }
 
-function buildSafePayload(form) {
+function buildSafePayload(form, leadId) {
   return {
+    id: leadId,
     status: 'new',
     first_name: cleanSingleLine(form.first_name, MAX_LENGTHS.name),
     last_name: cleanSingleLine(form.last_name, MAX_LENGTHS.name) || null,
@@ -212,6 +219,93 @@ function validatePayload(payload) {
   if (!payload.services_requested.length) errors.push('Please select at least one service.');
 
   return errors;
+}
+
+
+function createLeadId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (char) => {
+    const rand = Math.random() * 16 | 0;
+    const value = char === 'x' ? rand : (rand & 0x3 | 0x8);
+    return value.toString(16);
+  });
+}
+
+function cleanFileName(name) {
+  const fallback = 'yard-photo.jpg';
+  const cleaned = cleanSingleLine(name || fallback, 90)
+    .replace(/[^a-zA-Z0-9._-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '');
+  return cleaned || fallback;
+}
+
+function validateImageFiles(files) {
+  const errors = [];
+  const list = Array.from(files || []);
+
+  if (list.length > MAX_IMAGE_FILES) {
+    errors.push(`Please upload ${MAX_IMAGE_FILES} photos or fewer.`);
+  }
+
+  list.slice(0, MAX_IMAGE_FILES).forEach((file) => {
+    const typeLooksSafe = VALID_IMAGE_TYPES.has(file.type);
+    const nameLooksSafe = VALID_IMAGE_EXTENSIONS.test(file.name || '');
+
+    if (!typeLooksSafe && !nameLooksSafe) {
+      errors.push(`${file.name || 'One photo'} is not a supported image type. Use JPG, PNG, WEBP, HEIC, or HEIF.`);
+    }
+
+    if (file.size > MAX_IMAGE_BYTES) {
+      errors.push(`${file.name || 'One photo'} is too large. Please keep each image under 8 MB.`);
+    }
+  });
+
+  return errors;
+}
+
+async function uploadLeadImages(leadId, imageFiles) {
+  const files = Array.from(imageFiles || []).slice(0, MAX_IMAGE_FILES);
+  if (!files.length) return [];
+
+  const records = [];
+
+  for (const [index, file] of files.entries()) {
+    const safeName = cleanFileName(file.name);
+    const storagePath = `leads/${leadId}/${Date.now()}-${index + 1}-${safeName}`;
+    const mimeType = VALID_IMAGE_TYPES.has(file.type) ? file.type : 'image/jpeg';
+
+    const { error: uploadError } = await supabase.storage
+      .from(IMAGE_BUCKET)
+      .upload(storagePath, file, {
+        cacheControl: '3600',
+        contentType: mimeType,
+        upsert: false
+      });
+
+    if (uploadError) throw uploadError;
+
+    records.push({
+      lead_id: leadId,
+      bucket_id: IMAGE_BUCKET,
+      storage_path: storagePath,
+      file_name: safeName,
+      mime_type: mimeType,
+      file_size: file.size,
+      sort_order: index,
+      uploaded_by_role: 'anon'
+    });
+  }
+
+  if (!records.length) return [];
+
+  const { error: imageRecordError } = await supabase
+    .from('lawncare_lead_images')
+    .insert(records, { returning: 'minimal' });
+
+  if (imageRecordError) throw imageRecordError;
+
+  return records;
 }
 
 function getFriendlySupabaseError(insertError) {
@@ -257,6 +351,8 @@ function App() {
   const [form, setForm] = React.useState(initialForm);
   const [submitting, setSubmitting] = React.useState(false);
   const [submitted, setSubmitted] = React.useState(false);
+  const [submitNote, setSubmitNote] = React.useState('');
+  const [imageFiles, setImageFiles] = React.useState([]);
   const [error, setError] = React.useState('');
   const [errorDetail, setErrorDetail] = React.useState('');
   const formLoadedAt = React.useRef(Date.now());
@@ -283,6 +379,25 @@ function App() {
     });
   }
 
+
+  function handleImageChange(event) {
+    const files = Array.from(event.target.files || []).slice(0, MAX_IMAGE_FILES);
+    const imageErrors = validateImageFiles(files);
+    setImageFiles(files);
+
+    if (imageErrors.length) {
+      setError(imageErrors[0]);
+      setErrorDetail(imageErrors.join('\n'));
+    } else {
+      setError('');
+      setErrorDetail('');
+    }
+  }
+
+  function removeImage(fileName) {
+    setImageFiles((current) => current.filter((file) => file.name !== fileName));
+  }
+
   async function handleSubmit(event) {
     event.preventDefault();
     setError('');
@@ -303,8 +418,9 @@ function App() {
       return;
     }
 
-    const payload = buildSafePayload(form);
-    const validationErrors = validatePayload(payload);
+    const leadId = createLeadId();
+    const payload = buildSafePayload(form, leadId);
+    const validationErrors = [...validatePayload(payload), ...validateImageFiles(imageFiles)];
 
     if (validationErrors.length) {
       setError(validationErrors[0]);
@@ -327,6 +443,18 @@ function App() {
         return;
       }
 
+      if (imageFiles.length) {
+        try {
+          await uploadLeadImages(leadId, imageFiles);
+          setSubmitNote(`${imageFiles.length} yard photo${imageFiles.length === 1 ? '' : 's'} uploaded with your request.`);
+        } catch (imageError) {
+          console.error('Image upload failed:', imageError);
+          setSubmitNote('Your quote request was received, but the photos did not upload. I can ask you for photos by text if needed.');
+        }
+      } else {
+        setSubmitNote('');
+      }
+
       setSubmitted(true);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (requestError) {
@@ -340,7 +468,7 @@ function App() {
   }
 
   if (submitted) {
-    return <ThankYou />;
+    return <ThankYou note={submitNote} />;
   }
 
   return (
@@ -349,22 +477,38 @@ function App() {
         <div className="hero-pattern" aria-hidden="true" />
         <div className="hero-content">
           <div className="brand-row">
-            <div className="brand-mark" aria-hidden="true">☘</div>
+            <div className="brand-mark" aria-hidden="true">🌿</div>
             <div>
-              <p className="eyebrow">Affordable Residential Lawn Care</p>
+              <p className="eyebrow">Owner-operated lawn care</p>
               <h1 id="page-title">Request a Quick Lawn Quote</h1>
             </div>
           </div>
 
           <p className="hero-copy">
-            Mowing, weedeating, edging, and blowing for average homes, townhomes, and neighborhood properties.
+            Simple, affordable mowing, weedeating, edging, and blowing for homes, townhomes, and neighborhood properties.
           </p>
+
+          <div className="owner-pill" aria-label="Owner contact">
+            <strong>Sabastian Bradley</strong>
+            <span>Local residential lawn care</span>
+          </div>
 
           <div className="trust-grid" aria-label="Service highlights">
             <span>Starting at $65</span>
-            <span>Route service available</span>
+            <span>Weekly & bi-weekly routes</span>
             <span>Call or text friendly</span>
           </div>
+        </div>
+      </section>
+
+      <section className="contact-card" aria-label="Contact information">
+        <p>
+          <strong>Sabastian Bradley</strong>
+          <span>Owner / Operator</span>
+        </p>
+        <div className="contact-links">
+          <a href="mailto:sabastianbradley76@gmail.com">sabastianbradley76@gmail.com</a>
+          <a href="tel:+13365521877">(336) 552-1877</a>
         </div>
       </section>
 
@@ -551,7 +695,36 @@ function App() {
           </Field>
         </FormSection>
 
-        <FormSection number="5" title="Best way to reach you">
+
+        <FormSection number="5" title="Add yard photos">
+          <p className="photo-help">
+            Optional, but helpful. Upload up to {MAX_IMAGE_FILES} photos of the front, back, side yard, gate, or overgrown areas.
+          </p>
+
+          <label className="file-card">
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp,image/heic,image/heif"
+              multiple
+              onChange={handleImageChange}
+            />
+            <span>Tap to upload yard photos</span>
+            <small>JPG, PNG, WEBP, HEIC, or HEIF · 8 MB max each</small>
+          </label>
+
+          {imageFiles.length ? (
+            <div className="photo-list" aria-label="Selected photos">
+              {imageFiles.map((file) => (
+                <div className="photo-chip" key={`${file.name}-${file.size}`}>
+                  <span>{file.name}</span>
+                  <button type="button" onClick={() => removeImage(file.name)} aria-label={`Remove ${file.name}`}>Remove</button>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </FormSection>
+
+        <FormSection number="6" title="Best way to reach you">
           <Field label="Preferred contact method">
             <select value={form.preferred_contact} onChange={(event) => updateField('preferred_contact', event.target.value)}>
               <option value="text">Text me</option>
@@ -633,7 +806,7 @@ function Field({ label, hint, required, children }) {
   );
 }
 
-function ThankYou() {
+function ThankYou({ note }) {
   return (
     <main className="page-shell thank-you-shell">
       <section className="thank-you-card">
@@ -643,6 +816,12 @@ function ThankYou() {
         <p>
           I’ll contact you by call or text to confirm the details, quote the yard, and get you on the route if it’s a good fit.
         </p>
+        {note ? <p className="thank-you-note">{note}</p> : null}
+        <div className="thank-you-contact">
+          <strong>Sabastian Bradley</strong>
+          <a href="mailto:sabastianbradley76@gmail.com">sabastianbradley76@gmail.com</a>
+          <a href="tel:+13365521877">(336) 552-1877</a>
+        </div>
         <a className="submit-button secondary-action" href="tel:+13365521877">Call or text now</a>
       </section>
     </main>
